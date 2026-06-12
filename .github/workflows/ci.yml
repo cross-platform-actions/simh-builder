@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ matrix.platform.runner }}
+    container: ${{ matrix.platform.container }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        simulator:
+          - vax
+
+        platform:
+          # The Linux build runs in an Alpine container so the binary can be
+          # fully statically linked, including the C standard library (musl).
+          - operating_system: linux
+            architecture: x86-64
+            runner: ubuntu-latest
+            container: alpine:latest
+
+          - operating_system: linux
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+            container: alpine:latest
+
+          - operating_system: macos
+            architecture: arm64
+            runner: macos-latest
+            container: ''
+
+    steps:
+      - name: Install Dependencies (Linux)
+        if: matrix.platform.operating_system == 'linux'
+        run: |
+          apk add --no-cache \
+            file \
+            gcc \
+            git \
+            github-cli \
+            linux-headers \
+            make \
+            musl-dev
+
+      - name: Clone Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The simh makefile links any Homebrew library it detects. Install the
+      # wanted libraries and remove their dynamic libraries, forcing the
+      # linker to fall back to the static archives. The remaining dynamic
+      # libraries are all system libraries, present on every macOS machine.
+      # Note: pcre2 needs no handling, the makefile picks the system provided
+      # /usr/lib/libpcre2-8.dylib. Removing the Homebrew pcre2 dynamic
+      # libraries would break the runner's git, which links against them.
+      - name: Install Dependencies (macOS)
+        if: matrix.platform.operating_system == 'macos'
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: true
+        run: |
+          brew install libpng vde
+
+          for package in libpng vde; do
+            rm "$(brew --prefix)/opt/$package/lib/"*.dylib
+          done
+
+      - name: Build SIMH
+        run: ./build.sh '${{ matrix.simulator }}'
+
+      - name: Test Binary
+        env:
+          simulator: ${{ matrix.simulator }}
+          operating_system: ${{ matrix.platform.operating_system }}
+          architecture: ${{ matrix.platform.architecture }}
+        run: |
+          tar -xf "output/$simulator-$operating_system-$architecture.tar"
+          echo exit | "./$simulator" | grep -i 'simulator Open SIMH'
+
+      - name: Verify Static Linking (Linux)
+        if: matrix.platform.operating_system == 'linux'
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: file "./$simulator" | grep 'statically linked'
+
+      - name: Verify No Homebrew Dependencies (macOS)
+        if: matrix.platform.operating_system == 'macos'
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: |
+          otool -L "./$simulator"
+          ! otool -L "./$simulator" | grep -q "$(brew --prefix)"
+
+      - name: Create Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set the repo explicitly so gh does not shell out to git to
+          # detect it.
+          GH_REPO: ${{ github.repository }}
+          github_ref_name: ${{ github.ref_name }}
+        run: |
+          version="${github_ref_name#v}"
+
+          # Matrix jobs run in parallel; the first to arrive creates the
+          # draft release, the rest upload their artifacts to it.
+          # (gh release create with --draft does not deduplicate by tag.)
+          if gh release view "$github_ref_name" >/dev/null 2>&1; then
+            gh release upload "$github_ref_name" output/* --clobber
+          else
+            sed -n "/^## \[${version}\]/,/^## \[/{/^## \[${version}\]/d;/^## \[/d;p;}" changelog.md \
+              | gh release create \
+                "$github_ref_name" \
+                --title "SIMH ${version}" \
+                --draft \
+                --notes-file - \
+                output/*
+          fi
