@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+
+# Cancel superseded runs for the same branch or pull request. Tag (release)
+# builds are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build-linux:
+    name: Build (Linux)
+    runs-on: ${{ matrix.architecture.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The simulator list is shared with the macOS job below via a YAML
+        # anchor, so new simulators are added in one place. To add one, add it
+        # here and to the table in the readme. The name needs to match a target
+        # in the simh makefile.
+        simulator: &simulators
+          - vax
+
+        architecture:
+          - name: x86-64
+            runner: ubuntu-latest
+
+          - name: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The Linux build runs in an Alpine container so the binary can be fully
+      # statically linked, including the C standard library (musl). The build
+      # runs via "docker run" rather than the job's "container:" because GitHub
+      # cannot run JavaScript actions (actions/checkout) in an Arm64 musl
+      # container. The resulting static binary has no libc dependency, so the
+      # remaining steps can run it directly on the glibc host.
+      - name: Build SIMH
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: |
+          docker run \
+            --rm \
+            --env simulator \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            alpine:latest \
+            sh -c '
+              apk add --no-cache gcc git linux-headers make musl-dev &&
+              ./build.sh "$simulator"
+            '
+
+      # build.sh lowercases the binary and archive name, so mirror that here.
+      - name: Test Binary
+        env:
+          simulator: ${{ matrix.simulator }}
+          architecture: ${{ matrix.architecture.name }}
+        run: |
+          binary=$(echo "$simulator" | tr '[:upper:]' '[:lower:]')
+          tar -xf "output/$binary-linux-$architecture.tar"
+          echo exit | "./$binary" | grep -i 'simulator Open SIMH'
+
+      # A fully static binary is reported as either "statically linked" or, when
+      # built as a position independent executable, "static-pie linked".
+      - name: Verify Static Linking
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: |
+          binary=$(echo "$simulator" | tr '[:upper:]' '[:lower:]')
+          file "./$binary"
+          file "./$binary" | grep -Eq 'statically linked|static-pie linked'
+
+      - name: Upload Artifact
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: linux-${{ matrix.architecture.name }}-${{ matrix.simulator }}
+          path: output/*.tar
+          if-no-files-found: error
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        simulator: *simulators
+
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The simh makefile links any Homebrew library it detects. Install the
+      # wanted libraries and remove their dynamic libraries, forcing the
+      # linker to fall back to the static archives. The remaining dynamic
+      # libraries are all system libraries, present on every macOS machine.
+      # Note: pcre2 needs no handling, the makefile picks the system provided
+      # /usr/lib/libpcre2-8.dylib. Removing the Homebrew pcre2 dynamic
+      # libraries would break the runner's git, which links against them.
+      - name: Install Dependencies
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: true
+        run: |
+          brew install libpng vde
+
+          for package in libpng vde; do
+            rm "$(brew --prefix)/opt/$package/lib/"*.dylib
+          done
+
+      - name: Build SIMH
+        run: ./build.sh '${{ matrix.simulator }}'
+
+      # build.sh lowercases the binary and archive name, so mirror that here.
+      - name: Test Binary
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: |
+          binary=$(echo "$simulator" | tr '[:upper:]' '[:lower:]')
+          tar -xf "output/$binary-macos-arm64.tar"
+          echo exit | "./$binary" | grep -i 'simulator Open SIMH'
+
+      - name: Verify No Homebrew Dependencies
+        env:
+          simulator: ${{ matrix.simulator }}
+        run: |
+          binary=$(echo "$simulator" | tr '[:upper:]' '[:lower:]')
+          otool -L "./$binary"
+          ! otool -L "./$binary" | grep -q "$(brew --prefix)"
+
+      - name: Upload Artifact
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: macos-arm64-${{ matrix.simulator }}
+          path: output/*.tar
+          if-no-files-found: error
+
+  # A single release job avoids the race of every matrix job racing to create
+  # the same draft release. It runs once, after all builds, and creates the
+  # release from the collected artifacts.
+  release:
+    name: Release
+    needs:
+      - build-linux
+      - build-macos
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: output
+          merge-multiple: true
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set the repo explicitly so gh does not shell out to git to detect it.
+          GH_REPO: ${{ github.repository }}
+          github_ref_name: ${{ github.ref_name }}
+        run: |
+          version="${github_ref_name#v}"
+
+          sed -n "/^## \[${version}\]/,/^## \[/{/^## \[${version}\]/d;/^## \[/d;p;}" changelog.md \
+            | gh release create \
+              "$github_ref_name" \
+              --title "SIMH ${version}" \
+              --draft \
+              --notes-file - \
+              output/*
